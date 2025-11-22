@@ -17,6 +17,7 @@ import homework5.logging
 # ================================================================
 
 def build_packet(ptype: str, seq, payload: bytes = b"") -> bytes:
+    """Create a safe packet body with hex payload + 4-byte length prefix."""
     if isinstance(payload, bytes):
         payload_hex = payload.hex()
     else:
@@ -28,6 +29,7 @@ def build_packet(ptype: str, seq, payload: bytes = b"") -> bytes:
 
 
 def try_parse_packet(buffer: bytearray):
+    """Extract one length-prefixed packet from buffer if available."""
     if len(buffer) < 4:
         return None, 0
 
@@ -38,9 +40,9 @@ def try_parse_packet(buffer: bytearray):
 
     raw = buffer[4:4 + pkt_len]
     text = raw.decode("utf-8", errors="ignore")
-    parts = text.split("|", 2)
     consumed = 4 + pkt_len
 
+    parts = text.split("|", 2)
     if len(parts) != 3:
         return None, consumed
 
@@ -49,7 +51,7 @@ def try_parse_packet(buffer: bytearray):
     if seq_str.isdigit():
         seq = int(seq_str)
     else:
-        seq = seq_str
+        seq = seq_str  # "fin"
 
     try:
         payload = bytes.fromhex(payload_hex) if payload_hex else b""
@@ -67,7 +69,7 @@ def send(sock: socket.socket, data: bytes):
     logger = homework5.logging.get_logger("hw5-sender")
 
     seq = 0
-    max_payload = homework5.MAX_PACKET - 20   # BIGGER CHUNK = FASTER
+    max_payload = homework5.MAX_PACKET - 20  # maximize throughput
 
     est_rtt = 0.2
     dev_rtt = 0.1
@@ -78,7 +80,11 @@ def send(sock: socket.socket, data: bytes):
 
     recv_buf = bytearray()
 
+    # ------------------------------------------------------------
+    #                     SEND DATA PACKETS
+    # ------------------------------------------------------------
     while pos < total:
+
         payload = data[pos:pos + max_payload]
         pkt = build_packet("data", seq, payload)
 
@@ -86,28 +92,30 @@ def send(sock: socket.socket, data: bytes):
             send_time = time.time()
             sock.send(pkt)
             sock.settimeout(timeout)
+            matched_ack = False
 
             try:
                 chunk = sock.recv(4096)
                 recv_buf.extend(chunk)
 
+                # Drain all packets in buffer
                 while True:
                     pkt_obj, consumed = try_parse_packet(recv_buf)
                     if consumed == 0:
                         break
                     del recv_buf[:consumed]
 
+                    # Only accept ACK for THIS seq (fix skipping bug)
                     if pkt_obj and pkt_obj["type"] == "ack":
                         if pkt_obj["seq"] == seq:
-                            sample = time.time() - send_time
-                            est_rtt = 0.875 * est_rtt + 0.125 * sample
-                            dev_rtt = 0.75 * dev_rtt + 0.25 * abs(sample - est_rtt)
-                            timeout = max(0.15, est_rtt + 2 * dev_rtt)
-                            break
+                            matched_ack = True
 
-                else:
-                    continue
-                break
+                if matched_ack:
+                    sample = time.time() - send_time
+                    est_rtt = 0.875 * est_rtt + 0.125 * sample
+                    dev_rtt = 0.75 * dev_rtt + 0.25 * abs(sample - est_rtt)
+                    timeout = max(0.15, est_rtt + 2 * dev_rtt)
+                    break  # leave retransmit loop
 
             except socket.timeout:
                 continue
@@ -115,14 +123,15 @@ def send(sock: socket.socket, data: bytes):
         pos += max_payload
         seq += 1
 
-    # FIN handshake
+    # ------------------------------------------------------------
+    #                      FIN HANDSHAKE
+    # ------------------------------------------------------------
     finpkt = build_packet("fin", "fin", b"")
     recv_buf = bytearray()
 
     while True:
         sock.send(finpkt)
         sock.settimeout(timeout)
-
         try:
             chunk = sock.recv(4096)
             recv_buf.extend(chunk)
@@ -135,10 +144,8 @@ def send(sock: socket.socket, data: bytes):
 
                 if pkt_obj and pkt_obj["type"] == "ack" and pkt_obj["seq"] == "fin":
                     return
-
         except socket.timeout:
             continue
-
 
 
 # ================================================================
@@ -167,7 +174,6 @@ def recv(sock: socket.socket, dest: io.BufferedIOBase) -> int:
 
                 if consumed == 0:
                     break
-
                 del recv_buf[:consumed]
 
                 if not pkt_obj:
